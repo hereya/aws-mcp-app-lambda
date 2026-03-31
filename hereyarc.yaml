@@ -1,5 +1,5 @@
 name: hereya/aws-mcp-app-lambda
-version: 0.1.0
+version: 0.1.1
 description: "Deploys a Lambda function behind API Gateway with per-org OAuth authorization, subdomain routing, and hereyaProjectEnv-based IAM policy and secret injection."
 visibility: public
 iac: cdk
