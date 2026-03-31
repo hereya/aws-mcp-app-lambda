@@ -142,6 +142,49 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       fn
     );
 
+    // Compute service URL for PRM (custom domain or API endpoint)
+    const serviceUrl = customDomain
+      ? `https://${customDomain}`
+      : httpApi.apiEndpoint;
+
+    // Protected Resource Metadata (RFC 9728) — required for MCP OAuth discovery
+    const prmLambda = new lambda.Function(this, "PrmHandler", {
+      runtime: lambda.Runtime.NODEJS_22_X,
+      handler: "index.handler",
+      code: lambda.Code.fromInline(`
+        exports.handler = async () => ({
+          statusCode: 200,
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "public, max-age=3600",
+            "Access-Control-Allow-Origin": "*",
+          },
+          body: JSON.stringify({
+            resource: process.env.SERVICE_URL + "/mcp",
+            authorization_servers: [process.env.OAUTH_SERVER_URL + "/oauth/" + process.env.ORGANIZATION_ID],
+            bearer_methods_supported: ["header"],
+            scopes_supported: ["mcp:access"],
+          }),
+        });
+      `),
+      memorySize: 128,
+      timeout: cdk.Duration.seconds(5),
+      environment: {
+        SERVICE_URL: serviceUrl,
+        OAUTH_SERVER_URL: oauthServerUrl,
+        ORGANIZATION_ID: organizationId,
+      },
+    });
+
+    httpApi.addRoutes({
+      path: "/.well-known/oauth-protected-resource",
+      methods: [apigwv2.HttpMethod.GET],
+      integration: new integrations.HttpLambdaIntegration(
+        "PrmIntegration",
+        prmLambda
+      ),
+    });
+
     httpApi.addRoutes({
       path: "/mcp",
       methods: [apigwv2.HttpMethod.POST],
