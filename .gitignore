@@ -1,6 +1,8 @@
 *.js
 !jest.config.js
 !lib/authorizer/index.js
+!lib/frontend-authorizer/index.js
+!lib/auth-lambda/index.js
 *.d.ts
 node_modules
 

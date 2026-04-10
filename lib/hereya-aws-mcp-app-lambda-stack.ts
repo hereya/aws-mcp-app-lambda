@@ -9,6 +9,8 @@ import * as route53 from "aws-cdk-lib/aws-route53";
 import * as targets from "aws-cdk-lib/aws-route53-targets";
 import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
+import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
+import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -81,7 +83,16 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       )
     );
 
-    // Lambda function
+
+    // Cognito config (from aws/cognito package outputs via hereyaProjectEnv)
+    const cognitoUserPoolId = plainEnv["userPoolId"] ?? nonPolicyEnv["userPoolId"];
+    const cognitoClientId = plainEnv["userPoolClientId"] ?? nonPolicyEnv["userPoolClientId"];
+    const cognitoRegion = plainEnv["awsCognitoRegion"] ?? nonPolicyEnv["awsCognitoRegion"] ?? process.env["CDK_DEFAULT_REGION"] ?? "us-east-1";
+
+    // -----------------------------------------------------------------------
+    // Lambda 1: App Handler (Org Lambda — MCP + frontend routes)
+    // -----------------------------------------------------------------------
+
     const fn = new lambda.Function(this, "Handler", {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: handlerName,
@@ -110,7 +121,10 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       }
     }
 
-    // Authorizer Lambda for JWT validation + org check
+    // -----------------------------------------------------------------------
+    // MCP OAuth Authorizer Lambda
+    // -----------------------------------------------------------------------
+
     const authorizerFn = new lambda.Function(this, "AuthorizerHandler", {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: "index.handler",
@@ -132,7 +146,10 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       }
     );
 
+    // -----------------------------------------------------------------------
     // HTTP API
+    // -----------------------------------------------------------------------
+
     const httpApi = new apigwv2.HttpApi(this, "HttpApi", {
       apiName: this.stackName,
     });
@@ -147,7 +164,10 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       ? `https://${customDomain}`
       : httpApi.apiEndpoint;
 
-    // Protected Resource Metadata (RFC 9728) — required for MCP OAuth discovery
+    // -----------------------------------------------------------------------
+    // Protected Resource Metadata (RFC 9728)
+    // -----------------------------------------------------------------------
+
     const prmLambda = new lambda.Function(this, "PrmHandler", {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: "index.handler",
@@ -185,6 +205,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       ),
     });
 
+    // MCP route (existing)
     httpApi.addRoutes({
       path: "/mcp",
       methods: [apigwv2.HttpMethod.POST],
@@ -192,7 +213,107 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       authorizer: httpAuthorizer,
     });
 
-    // Custom domain
+    // -----------------------------------------------------------------------
+    // Frontend Authorizer Lambda (Cognito JWT cookie validation)
+    // -----------------------------------------------------------------------
+
+    let frontendAuthorizer: authorizers.HttpLambdaAuthorizer | undefined;
+
+    if (cognitoUserPoolId && cognitoClientId) {
+      const frontendAuthorizerFn = new lambda.Function(
+        this,
+        "FrontendAuthorizerHandler",
+        {
+          runtime: lambda.Runtime.NODEJS_22_X,
+          handler: "index.handler",
+          code: lambda.Code.fromAsset(
+            path.join(__dirname, "frontend-authorizer")
+          ),
+          memorySize: 128,
+          timeout: cdk.Duration.seconds(10),
+          environment: {
+            COGNITO_USER_POOL_ID: cognitoUserPoolId,
+            COGNITO_REGION: cognitoRegion,
+          },
+        }
+      );
+
+      frontendAuthorizer = new authorizers.HttpLambdaAuthorizer(
+        "FrontendAuthorizer",
+        frontendAuthorizerFn,
+        {
+          responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
+          resultsCacheTtl: cdk.Duration.seconds(0), // No caching — cookie-based
+          identitySource: ["$request.header.Cookie"],
+        }
+      );
+
+      // -------------------------------------------------------------------
+      // Auth Lambda (login/OTP/verify/logout)
+      // -------------------------------------------------------------------
+
+      const authLambdaEnv: Record<string, string> = {
+        COGNITO_USER_POOL_ID: cognitoUserPoolId,
+        COGNITO_CLIENT_ID: cognitoClientId,
+        COGNITO_REGION: cognitoRegion,
+        CUSTOM_DOMAIN: customDomain ?? "",
+      };
+
+      const authLambdaFn = new lambda.Function(this, "AuthLambdaHandler", {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        handler: "index.handler",
+        code: lambda.Code.fromAsset(path.join(__dirname, "auth-lambda")),
+        memorySize: 128,
+        timeout: cdk.Duration.seconds(15),
+        environment: authLambdaEnv,
+      });
+
+      // Grant Auth Lambda access to all secrets from hereyaProjectEnv
+      // (same secrets already created for the main handler — reuse them)
+      const authSecretKeys: string[] = [];
+      for (const { key, secret, secretName } of secretEnvEntries) {
+        authLambdaFn.addEnvironment(key, secretName);
+        secret.grantRead(authLambdaFn);
+        authSecretKeys.push(key);
+      }
+      if (authSecretKeys.length > 0) {
+        authLambdaFn.addEnvironment("SECRET_KEYS", authSecretKeys.join(","));
+      }
+
+      const authLambdaIntegration = new integrations.HttpLambdaIntegration(
+        "AuthLambdaIntegration",
+        authLambdaFn
+      );
+
+      // Auth routes (no authorizer — always accessible)
+      httpApi.addRoutes({
+        path: "/{app}/auth/{proxy+}",
+        methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+        integration: authLambdaIntegration,
+      });
+
+      // Frontend routes (with Frontend Authorizer → Org Lambda)
+      const frontendRoutePatterns = [
+        "/{app}/view/{proxy+}",
+        "/{app}/data/{proxy+}",
+        "/{app}/action/{proxy+}",
+        "/{app}/form/{proxy+}",
+      ];
+
+      for (const routePath of frontendRoutePatterns) {
+        httpApi.addRoutes({
+          path: routePath,
+          methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
+          integration: lambdaIntegration,
+          authorizer: frontendAuthorizer,
+        });
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Custom domain + DNS
+    // -----------------------------------------------------------------------
+
     if (customDomain && customDomainZone) {
       if (!wildcardCertificateArn) {
         throw new Error(
@@ -210,6 +331,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         domainName: customDomainZone,
       });
 
+      // API Gateway custom domain for MCP (exact domain)
       const domainName = new apigwv2.DomainName(this, "DomainName", {
         domainName: customDomain,
         certificate,
@@ -230,6 +352,102 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           )
         ),
       });
+
+      // -------------------------------------------------------------------
+      // CloudFront distribution for frontend (*.{customDomain})
+      // CloudFront REQUIRES ACM certificates in us-east-1, regardless of
+      // which region this stack is deployed to. We auto-create one via
+      // DnsValidatedCertificate which provisions it in us-east-1 with
+      // DNS validation through the same hosted zone.
+      // -------------------------------------------------------------------
+
+      if (cognitoUserPoolId && cognitoClientId) {
+        const cloudfrontCertificate = new acm.DnsValidatedCertificate(
+          this,
+          "CloudFrontCertificate",
+          {
+            domainName: `*.${customDomain}`,
+            hostedZone,
+            region: "us-east-1",
+          }
+        );
+
+        // CloudFront Function: extract app subdomain → prepend to path
+        const cfFunction = new cloudfront.Function(this, "SubdomainRewrite", {
+          code: cloudfront.FunctionCode.fromInline(`
+function handler(event) {
+  var request = event.request;
+  var host = request.headers.host.value;
+  var customDomain = '${customDomain}';
+  if (host !== customDomain && host.endsWith('.' + customDomain)) {
+    var appName = host.slice(0, -(customDomain.length + 1));
+    request.uri = '/' + appName + request.uri;
+  }
+  return request;
+}
+          `),
+          functionName: `${this.stackName}-subdomain-rewrite`,
+        });
+
+        // API Gateway origin
+        const apiDomainName = cdk.Fn.select(
+          2,
+          cdk.Fn.split("/", httpApi.apiEndpoint)
+        ); // extract domain from https://xxx.execute-api...
+
+        const distribution = new cloudfront.Distribution(
+          this,
+          "FrontendDistribution",
+          {
+            certificate: cloudfrontCertificate,
+            domainNames: [`*.${customDomain}`],
+            defaultBehavior: {
+              origin: new origins.HttpOrigin(apiDomainName, {
+                protocolPolicy: cloudfront.OriginProtocolPolicy.HTTPS_ONLY,
+              }),
+              viewerProtocolPolicy:
+                cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+              allowedMethods: cloudfront.AllowedMethods.ALLOW_ALL,
+              cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+              originRequestPolicy: new cloudfront.OriginRequestPolicy(
+                this,
+                "FrontendOriginPolicy",
+                {
+                  cookieBehavior:
+                    cloudfront.OriginRequestCookieBehavior.allowList(
+                      "hereya_id_token"
+                    ),
+                  headerBehavior:
+                    cloudfront.OriginRequestHeaderBehavior.allowList(
+                      "Content-Type"
+                    ),
+                  queryStringBehavior:
+                    cloudfront.OriginRequestQueryStringBehavior.all(),
+                }
+              ),
+              functionAssociations: [
+                {
+                  function: cfFunction,
+                  eventType: cloudfront.FunctionEventType.VIEWER_REQUEST,
+                },
+              ],
+            },
+          }
+        );
+
+        // Route53 wildcard → CloudFront
+        new route53.ARecord(this, "WildcardAliasRecord", {
+          zone: hostedZone,
+          recordName: `*.${customDomain}`,
+          target: route53.RecordTarget.fromAlias(
+            new targets.CloudFrontTarget(distribution)
+          ),
+        });
+
+        new cdk.CfnOutput(this, "FrontendDistributionDomain", {
+          value: distribution.distributionDomainName,
+        });
+      }
 
       new cdk.CfnOutput(this, "ServiceUrl", {
         value: `https://${customDomain}`,
