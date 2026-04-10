@@ -321,6 +321,15 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           authorizer: frontendAuthorizer,
         });
       }
+
+      // Catch-all for unmatched frontend paths (e.g., /{app}/ root)
+      // More specific routes above take priority in API Gateway HTTP API
+      httpApi.addRoutes({
+        path: "/{proxy+}",
+        methods: [apigwv2.HttpMethod.GET],
+        integration: lambdaIntegration,
+        authorizer: frontendAuthorizer,
+      });
     }
 
     // -----------------------------------------------------------------------
