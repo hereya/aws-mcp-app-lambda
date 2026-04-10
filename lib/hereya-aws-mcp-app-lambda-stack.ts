@@ -93,6 +93,11 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     // Lambda 1: App Handler (Org Lambda — MCP + frontend routes)
     // -----------------------------------------------------------------------
 
+    // Pass deploy-time config vars to the handler (not in hereyaProjectEnv)
+    if (customDomain) {
+      plainEnv["customDomain"] = customDomain;
+    }
+
     const fn = new lambda.Function(this, "Handler", {
       runtime: lambda.Runtime.NODEJS_22_X,
       handler: handlerName,
@@ -244,7 +249,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         {
           responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
           resultsCacheTtl: cdk.Duration.seconds(0), // No caching — cookie-based
-          identitySource: ["$request.header.Cookie"],
+          identitySource: [], // No identity source — always invoke authorizer (supports public endpoints without cookies)
         }
       );
 
