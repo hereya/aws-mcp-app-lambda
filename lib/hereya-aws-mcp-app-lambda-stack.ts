@@ -285,6 +285,14 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         authLambdaFn.addEnvironment("SECRET_KEYS", authSecretKeys.join(","));
       }
 
+      // Grant Auth Lambda Cognito permissions (same IAM policies as main handler)
+      for (const [, value] of Object.entries(policyEnv)) {
+        const policy = JSON.parse(value as string);
+        for (const statement of policy.Statement) {
+          authLambdaFn.addToRolePolicy(iam.PolicyStatement.fromJson(statement));
+        }
+      }
+
       const authLambdaIntegration = new integrations.HttpLambdaIntegration(
         "AuthLambdaIntegration",
         authLambdaFn
