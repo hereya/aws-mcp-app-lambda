@@ -142,7 +142,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     const appLambdaRole = new iam.Role(this, "AppLambdaRole", {
       assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
       managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyArn(
+        iam.ManagedPolicy.fromManagedPolicyArn(
           this,
           "AppLambdaBasicExec",
           "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
@@ -309,7 +309,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           authorizerPayloadFormatVersion: "2.0",
           enableSimpleResponses: true,
           authorizerResultTtlInSeconds: 0,
-          identitySource: "", // empty = always invoke (supports public endpoints)
+          identitySource: [] as string[], // empty = always invoke (supports public endpoints)
           name: "FrontendAuthorizer",
         }
       );
