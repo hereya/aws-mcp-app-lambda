@@ -90,7 +90,16 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     const cognitoRegion = plainEnv["awsCognitoRegion"] ?? nonPolicyEnv["awsCognitoRegion"] ?? process.env["CDK_DEFAULT_REGION"] ?? "us-east-1";
 
     // -----------------------------------------------------------------------
-    // Lambda 1: App Handler (Org Lambda — MCP + frontend routes)
+    // Lambda naming prefix for per-app Lambdas (derived from customDomain)
+    // -----------------------------------------------------------------------
+
+    const orgPrefix = customDomain
+      ? customDomain.split(".")[0]
+      : this.stackName.substring(0, 20);
+    const appLambdaNamePrefix = `${orgPrefix}-app-`;
+
+    // -----------------------------------------------------------------------
+    // Lambda 1: App Handler (Org Lambda — MCP only)
     // -----------------------------------------------------------------------
 
     // Pass deploy-time config vars to the handler (not in hereyaProjectEnv)
@@ -125,6 +134,41 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         fn.addToRolePolicy(iam.PolicyStatement.fromJson(statement));
       }
     }
+
+    // -----------------------------------------------------------------------
+    // Shared IAM Role for per-app Lambdas
+    // -----------------------------------------------------------------------
+
+    const appLambdaRole = new iam.Role(this, "AppLambdaRole", {
+      assumedBy: new iam.ServicePrincipal("lambda.amazonaws.com"),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyArn(
+          this,
+          "AppLambdaBasicExec",
+          "arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole"
+        ),
+      ],
+    });
+
+    // Apply same IAM policies from dependency packages (Aurora, S3, etc.)
+    for (const [, value] of Object.entries(policyEnv)) {
+      const policy = JSON.parse(value as string);
+      for (const statement of policy.Statement) {
+        appLambdaRole.addToPolicy(iam.PolicyStatement.fromJson(statement));
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Lambda Layer for per-app runtime utilities
+    // -----------------------------------------------------------------------
+
+    const runtimeLayer = new lambda.LayerVersion(this, "AppRuntimeLayer", {
+      code: lambda.Code.fromAsset(
+        path.join(hereyaProjectRootDir, "dist", "layer")
+      ),
+      compatibleRuntimes: [lambda.Runtime.NODEJS_22_X],
+      description: "Hereya runtime (db, storage) for per-app Lambdas",
+    });
 
     // -----------------------------------------------------------------------
     // MCP OAuth Authorizer Lambda
@@ -219,12 +263,17 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     });
 
     // -----------------------------------------------------------------------
-    // Frontend Authorizer Lambda (Cognito JWT cookie validation)
+    // Frontend Authorizer + Auth Lambda (for per-app Lambdas)
     // -----------------------------------------------------------------------
 
-    let frontendAuthorizer: authorizers.HttpLambdaAuthorizer | undefined;
+    // These are created at CDK time. Their IDs are passed to the org Lambda
+    // so it can create per-app API Gateway routes dynamically.
+
+    let frontendAuthorizerId: string | undefined;
+    let authIntegrationId: string | undefined;
 
     if (cognitoUserPoolId && cognitoClientId) {
+      // Frontend Authorizer Lambda
       const frontendAuthorizerFn = new lambda.Function(
         this,
         "FrontendAuthorizerHandler",
@@ -243,20 +292,30 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         }
       );
 
-      frontendAuthorizer = new authorizers.HttpLambdaAuthorizer(
-        "FrontendAuthorizer",
-        frontendAuthorizerFn,
+      // Grant API Gateway permission to invoke the frontend authorizer
+      frontendAuthorizerFn.addPermission("ApiGwAuthorizerInvoke", {
+        principal: new iam.ServicePrincipal("apigateway.amazonaws.com"),
+        sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${httpApi.apiId}/*`,
+      });
+
+      // Frontend Authorizer as L1 construct (to get authorizer ID)
+      const frontendAuthorizerCfn = new apigwv2.CfnAuthorizer(
+        this,
+        "FrontendAuthorizerCfn",
         {
-          responseTypes: [authorizers.HttpLambdaResponseType.SIMPLE],
-          resultsCacheTtl: cdk.Duration.seconds(0), // No caching — cookie-based
-          identitySource: [], // No identity source — always invoke authorizer (supports public endpoints without cookies)
+          apiId: httpApi.apiId,
+          authorizerType: "REQUEST",
+          authorizerUri: `arn:aws:apigateway:${this.region}:lambda:path/2015-03-31/functions/${frontendAuthorizerFn.functionArn}/invocations`,
+          authorizerPayloadFormatVersion: "2.0",
+          enableSimpleResponses: true,
+          authorizerResultTtlInSeconds: 0,
+          identitySource: "", // empty = always invoke (supports public endpoints)
+          name: "FrontendAuthorizer",
         }
       );
+      frontendAuthorizerId = frontendAuthorizerCfn.ref;
 
-      // -------------------------------------------------------------------
       // Auth Lambda (login/OTP/verify/logout)
-      // -------------------------------------------------------------------
-
       const authLambdaEnv: Record<string, string> = {
         COGNITO_USER_POOL_ID: cognitoUserPoolId,
         COGNITO_CLIENT_ID: cognitoClientId,
@@ -273,8 +332,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         environment: authLambdaEnv,
       });
 
-      // Grant Auth Lambda access to all secrets from hereyaProjectEnv
-      // (same secrets already created for the main handler — reuse them)
+      // Grant Auth Lambda access to secrets
       const authSecretKeys: string[] = [];
       for (const { key, secret, secretName } of secretEnvEntries) {
         authLambdaFn.addEnvironment(key, secretName);
@@ -285,7 +343,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         authLambdaFn.addEnvironment("SECRET_KEYS", authSecretKeys.join(","));
       }
 
-      // Grant Auth Lambda Cognito permissions (same IAM policies as main handler)
+      // Grant Auth Lambda Cognito permissions
       for (const [, value] of Object.entries(policyEnv)) {
         const policy = JSON.parse(value as string);
         for (const statement of policy.Statement) {
@@ -293,43 +351,86 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         }
       }
 
-      const authLambdaIntegration = new integrations.HttpLambdaIntegration(
-        "AuthLambdaIntegration",
-        authLambdaFn
+      // Grant API Gateway permission to invoke auth Lambda
+      authLambdaFn.addPermission("ApiGwInvoke", {
+        principal: new iam.ServicePrincipal("apigateway.amazonaws.com"),
+        sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${httpApi.apiId}/*/*`,
+      });
+
+      // Auth Lambda integration as L1 construct (to get integration ID)
+      const authIntegrationCfn = new apigwv2.CfnIntegration(
+        this,
+        "AuthIntegrationCfn",
+        {
+          apiId: httpApi.apiId,
+          integrationType: "AWS_PROXY",
+          integrationUri: authLambdaFn.functionArn,
+          payloadFormatVersion: "2.0",
+        }
       );
+      authIntegrationId = authIntegrationCfn.ref;
+    }
 
-      // Auth routes (no authorizer — always accessible)
-      httpApi.addRoutes({
-        path: "/{app}/auth/{proxy+}",
-        methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
-        integration: authLambdaIntegration,
-      });
+    // -----------------------------------------------------------------------
+    // Org Lambda: per-app Lambda management permissions
+    // -----------------------------------------------------------------------
 
-      // Frontend routes (with Frontend Authorizer → Org Lambda)
-      const frontendRoutePatterns = [
-        "/{app}/view/{proxy+}",
-        "/{app}/data/{proxy+}",
-        "/{app}/action/{proxy+}",
-        "/{app}/form/{proxy+}",
-      ];
+    const appLambdaArnPattern = `arn:aws:lambda:${this.region}:${this.account}:function:${appLambdaNamePrefix}*`;
 
-      for (const routePath of frontendRoutePatterns) {
-        httpApi.addRoutes({
-          path: routePath,
-          methods: [apigwv2.HttpMethod.GET, apigwv2.HttpMethod.POST],
-          integration: lambdaIntegration,
-          authorizer: frontendAuthorizer,
-        });
-      }
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "lambda:CreateFunction",
+          "lambda:UpdateFunctionCode",
+          "lambda:UpdateFunctionConfiguration",
+          "lambda:GetFunction",
+          "lambda:DeleteFunction",
+          "lambda:AddPermission",
+          "lambda:RemovePermission",
+          "lambda:InvokeFunction",
+        ],
+        resources: [appLambdaArnPattern],
+      })
+    );
 
-      // Catch-all for unmatched frontend paths (e.g., /{app}/ root)
-      // More specific routes above take priority in API Gateway HTTP API
-      httpApi.addRoutes({
-        path: "/{proxy+}",
-        methods: [apigwv2.HttpMethod.GET],
-        integration: lambdaIntegration,
-        authorizer: frontendAuthorizer,
-      });
+    // API Gateway route management
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "apigateway:POST",
+          "apigateway:DELETE",
+          "apigateway:GET",
+          "apigateway:PATCH",
+        ],
+        resources: [
+          `arn:aws:apigateway:${this.region}::/apis/${httpApi.apiId}/*`,
+        ],
+      })
+    );
+
+    // Pass shared role to per-app Lambdas
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["iam:PassRole"],
+        resources: [appLambdaRole.roleArn],
+      })
+    );
+
+    // -----------------------------------------------------------------------
+    // Org Lambda: environment variables for per-app Lambda management
+    // -----------------------------------------------------------------------
+
+    fn.addEnvironment("APP_LAMBDA_ROLE_ARN", appLambdaRole.roleArn);
+    fn.addEnvironment("APP_LAMBDA_NAME_PREFIX", appLambdaNamePrefix);
+    fn.addEnvironment("APP_LAMBDA_LAYER_ARN", runtimeLayer.layerVersionArn);
+    fn.addEnvironment("HTTP_API_ID", httpApi.apiId);
+    fn.addEnvironment("AWS_ACCOUNT_ID", this.account);
+
+    if (frontendAuthorizerId) {
+      fn.addEnvironment("FRONTEND_AUTHORIZER_ID", frontendAuthorizerId);
+    }
+    if (authIntegrationId) {
+      fn.addEnvironment("AUTH_INTEGRATION_ID", authIntegrationId);
     }
 
     // -----------------------------------------------------------------------
@@ -377,10 +478,6 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
 
       // -------------------------------------------------------------------
       // CloudFront distribution for frontend (*.{customDomain})
-      // CloudFront REQUIRES ACM certificates in us-east-1, regardless of
-      // which region this stack is deployed to. We auto-create one via
-      // DnsValidatedCertificate which provisions it in us-east-1 with
-      // DNS validation through the same hosted zone.
       // -------------------------------------------------------------------
 
       if (cognitoUserPoolId && cognitoClientId) {
@@ -394,7 +491,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           }
         );
 
-        // CloudFront Function: extract app subdomain → prepend to path
+        // CloudFront Function: extract app subdomain -> prepend to path
         const cfFunction = new cloudfront.Function(this, "SubdomainRewrite", {
           code: cloudfront.FunctionCode.fromInline(`
 function handler(event) {
@@ -415,7 +512,7 @@ function handler(event) {
         const apiDomainName = cdk.Fn.select(
           2,
           cdk.Fn.split("/", httpApi.apiEndpoint)
-        ); // extract domain from https://xxx.execute-api...
+        );
 
         const distribution = new cloudfront.Distribution(
           this,
@@ -457,7 +554,7 @@ function handler(event) {
           }
         );
 
-        // Route53 wildcard → CloudFront
+        // Route53 wildcard -> CloudFront
         new route53.ARecord(this, "WildcardAliasRecord", {
           zone: hostedZone,
           recordName: `*.${customDomain}`,
