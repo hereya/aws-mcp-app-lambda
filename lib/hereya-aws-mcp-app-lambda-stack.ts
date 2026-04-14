@@ -393,6 +393,14 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       })
     );
 
+    // Lambda layer access (needed when creating per-app Lambdas with layers)
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:GetLayerVersion"],
+        resources: [runtimeLayer.layerVersionArn],
+      })
+    );
+
     // API Gateway route management
     fn.addToRolePolicy(
       new iam.PolicyStatement({
