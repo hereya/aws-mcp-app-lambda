@@ -310,7 +310,7 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           enableSimpleResponses: true,
           authorizerResultTtlInSeconds: 0,
           identitySource: [] as string[], // empty = always invoke (supports public endpoints)
-          name: "FrontendAuthorizer",
+          name: "FrontendAuthorizerV2",
         }
       );
       frontendAuthorizerId = frontendAuthorizerCfn.ref;
