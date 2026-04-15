@@ -321,6 +321,8 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         COGNITO_CLIENT_ID: cognitoClientId,
         COGNITO_REGION: cognitoRegion,
         CUSTOM_DOMAIN: customDomain ?? "",
+        BUCKET_NAME: plainEnv["bucketName"] ?? "",
+        S3_PREFIX: plainEnv["s3Prefix"] ?? "",
       };
 
       const authLambdaFn = new lambda.Function(this, "AuthLambdaHandler", {
