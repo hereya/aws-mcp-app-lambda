@@ -548,7 +548,8 @@ function handler(event) {
                     ),
                   headerBehavior:
                     cloudfront.OriginRequestHeaderBehavior.allowList(
-                      "Content-Type"
+                      "Content-Type",
+                      "Accept-Language"
                     ),
                   queryStringBehavior:
                     cloudfront.OriginRequestQueryStringBehavior.all(),
