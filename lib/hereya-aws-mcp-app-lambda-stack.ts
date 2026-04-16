@@ -427,6 +427,57 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     );
 
     // -----------------------------------------------------------------------
+    // SSM SecureString for per-app agent-session signing secrets.
+    // Prefix-bound to /hereya/{organizationId}/apps/* so the org Lambda and
+    // per-app Lambdas can only touch their own org's secrets.
+    // -----------------------------------------------------------------------
+
+    const agentSecretSsmArn = `arn:aws:ssm:${this.region}:${this.account}:parameter/hereya/${organizationId}/apps/*`;
+
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "ssm:GetParameter",
+          "ssm:GetParameters",
+          "ssm:PutParameter",
+          "ssm:DeleteParameter",
+        ],
+        resources: [agentSecretSsmArn],
+      })
+    );
+
+    appLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["ssm:GetParameter"],
+        resources: [agentSecretSsmArn],
+      })
+    );
+
+    // KMS decrypt for the AWS-managed SSM key (SecureString).
+    // Scoped via ViaService condition so it only works through SSM.
+    const ssmKmsDecrypt = new iam.PolicyStatement({
+      actions: ["kms:Decrypt"],
+      resources: ["*"],
+      conditions: {
+        StringEquals: {
+          "kms:ViaService": `ssm.${this.region}.amazonaws.com`,
+        },
+      },
+    });
+    fn.addToRolePolicy(ssmKmsDecrypt);
+    appLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["kms:Decrypt"],
+        resources: ["*"],
+        conditions: {
+          StringEquals: {
+            "kms:ViaService": `ssm.${this.region}.amazonaws.com`,
+          },
+        },
+      })
+    );
+
+    // -----------------------------------------------------------------------
     // Org Lambda: environment variables for per-app Lambda management
     // -----------------------------------------------------------------------
 
@@ -435,6 +486,8 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     fn.addEnvironment("APP_LAMBDA_LAYER_ARN", runtimeLayer.layerVersionArn);
     fn.addEnvironment("HTTP_API_ID", httpApi.apiId);
     fn.addEnvironment("AWS_ACCOUNT_ID", this.account);
+    fn.addEnvironment("ORGANIZATION_ID", organizationId);
+    fn.addEnvironment("AGENT_SECRET_SSM_PREFIX", `/hereya/${organizationId}/apps`);
 
     if (frontendAuthorizerId) {
       fn.addEnvironment("FRONTEND_AUTHORIZER_ID", frontendAuthorizerId);
@@ -544,7 +597,8 @@ function handler(event) {
                 {
                   cookieBehavior:
                     cloudfront.OriginRequestCookieBehavior.allowList(
-                      "hereya_id_token"
+                      "hereya_id_token",
+                      "hereya_agent"
                     ),
                   headerBehavior:
                     cloudfront.OriginRequestHeaderBehavior.allowList(
