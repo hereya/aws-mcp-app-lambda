@@ -11,6 +11,7 @@ import * as acm from "aws-cdk-lib/aws-certificatemanager";
 import * as authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
+import * as cr from "aws-cdk-lib/custom-resources";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -554,13 +555,27 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           }
         );
 
-        // CloudFront Function: extract app subdomain -> prepend to path
+        // CloudFront Function: extract app subdomain → prepend to path, and
+        // (when the org Lambda regenerates the code) route custom vanity
+        // domains via a per-host domainMap lookup.
+        //
+        // This inline code is the BOOTSTRAP version with an empty domainMap.
+        // On the first `set-custom-domains`/`check-custom-domains` cycle the
+        // org Lambda overwrites this function with a regenerated version that
+        // contains the active domain→schema mapping. The shape must match
+        // src/custom-domain-template.ts in the hereya-apps repo so runtime
+        // updates are drop-in replacements.
         const cfFunction = new cloudfront.Function(this, "SubdomainRewrite", {
           code: cloudfront.FunctionCode.fromInline(`
 function handler(event) {
   var request = event.request;
   var host = request.headers.host.value;
-  var customDomain = '${customDomain}';
+  var customDomain = ${JSON.stringify(customDomain)};
+  var domainMap = {};
+  if (domainMap[host]) {
+    request.uri = '/' + domainMap[host] + request.uri;
+    return request;
+  }
   if (host !== customDomain && host.endsWith('.' + customDomain)) {
     var appName = host.slice(0, -(customDomain.length + 1));
     request.uri = '/' + appName + request.uri;
@@ -631,6 +646,167 @@ function handler(event) {
         new cdk.CfnOutput(this, "FrontendDistributionDomain", {
           value: distribution.distributionDomainName,
         });
+
+        // -----------------------------------------------------------------
+        // Custom-domain support wiring
+        //
+        // The org Lambda exposes MCP tools that swap the distribution's
+        // ViewerCertificate in-place when users request vanity domains. We:
+        //   1. Seed an SSM param with the bootstrap wildcard cert ARN on
+        //      first deploy (onUpdate is a no-op → subsequent deploys don't
+        //      overwrite the Lambda's live cert ARN).
+        //   2. Grant the org Lambda ACM (tag-scoped) + CloudFront (ARN-scoped)
+        //      + SSM (path-scoped) permissions.
+        //   3. Pass distribution + function identifiers + SSM path through env.
+        //
+        // NOTE on drift: if a future CDK stack change touches the Distribution
+        // or the CF function, CloudFormation will re-send CDK's inline config
+        // and overwrite the Lambda's live state. Remediation is to re-run
+        // `check-custom-domains` after the stack update.
+        // -----------------------------------------------------------------
+
+        const viewerCertSsmParamName = `/hereya/${organizationId}/viewer-cert-arn`;
+        const viewerCertSsmParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${viewerCertSsmParamName}`;
+
+        const seedViewerCertArn = new cr.AwsCustomResource(
+          this,
+          "ViewerCertSsmSeed",
+          {
+            onCreate: {
+              service: "SSM",
+              action: "PutParameter",
+              parameters: {
+                Name: viewerCertSsmParamName,
+                Value: cloudfrontCertificate.certificateArn,
+                Type: "String",
+                Overwrite: false,
+              },
+              physicalResourceId: cr.PhysicalResourceId.of(
+                `viewer-cert-seed-${organizationId}`
+              ),
+              ignoreErrorCodesMatching: "ParameterAlreadyExists",
+            },
+            onUpdate: {
+              service: "SSM",
+              action: "GetParameter",
+              parameters: { Name: viewerCertSsmParamName },
+              physicalResourceId: cr.PhysicalResourceId.of(
+                `viewer-cert-seed-${organizationId}`
+              ),
+              ignoreErrorCodesMatching: "ParameterNotFound",
+            },
+            onDelete: {
+              service: "SSM",
+              action: "DeleteParameter",
+              parameters: { Name: viewerCertSsmParamName },
+              ignoreErrorCodesMatching: "ParameterNotFound",
+            },
+            policy: cr.AwsCustomResourcePolicy.fromStatements([
+              new iam.PolicyStatement({
+                actions: [
+                  "ssm:PutParameter",
+                  "ssm:GetParameter",
+                  "ssm:DeleteParameter",
+                ],
+                resources: [viewerCertSsmParamArn],
+              }),
+            ]),
+            installLatestAwsSdk: false,
+          }
+        );
+        seedViewerCertArn.node.addDependency(cloudfrontCertificate);
+
+        // --- ACM (tag-scoped): any cert the org Lambda creates must be
+        //     tagged with its own orgId; all non-create actions are gated on
+        //     the same tag matching on the resource. This prevents org A from
+        //     touching org B's certs.
+        fn.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: [
+              "acm:RequestCertificate",
+              "acm:AddTagsToCertificate",
+            ],
+            resources: ["*"],
+            conditions: {
+              StringEquals: {
+                "aws:RequestTag/hereya:orgId": organizationId,
+              },
+              "ForAllValues:StringEquals": {
+                "aws:TagKeys": [
+                  "hereya:orgId",
+                  "hereya:schema",
+                  "hereya:domains",
+                ],
+              },
+            },
+          })
+        );
+        fn.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: [
+              "acm:DescribeCertificate",
+              "acm:DeleteCertificate",
+              "acm:ListTagsForCertificate",
+            ],
+            resources: [
+              `arn:aws:acm:us-east-1:${this.account}:certificate/*`,
+            ],
+            conditions: {
+              StringEquals: {
+                "aws:ResourceTag/hereya:orgId": organizationId,
+              },
+            },
+          })
+        );
+
+        // --- CloudFront (ARN-scoped): the org Lambda may only update ITS
+        //     own distribution and function.
+        fn.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: [
+              "cloudfront:GetDistribution",
+              "cloudfront:GetDistributionConfig",
+              "cloudfront:UpdateDistribution",
+            ],
+            resources: [
+              `arn:aws:cloudfront::${this.account}:distribution/${distribution.distributionId}`,
+            ],
+          })
+        );
+        fn.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: [
+              "cloudfront:GetFunction",
+              "cloudfront:DescribeFunction",
+              "cloudfront:UpdateFunction",
+              "cloudfront:PublishFunction",
+            ],
+            resources: [
+              `arn:aws:cloudfront::${this.account}:function/${cfFunction.functionName}`,
+            ],
+          })
+        );
+
+        // --- SSM (path-scoped): write the cert ARN on swap.
+        fn.addToRolePolicy(
+          new iam.PolicyStatement({
+            actions: ["ssm:GetParameter", "ssm:PutParameter"],
+            resources: [viewerCertSsmParamArn],
+          })
+        );
+
+        // --- Expose IDs to the org Lambda.
+        fn.addEnvironment(
+          "CLOUDFRONT_DISTRIBUTION_ID",
+          distribution.distributionId
+        );
+        fn.addEnvironment("CLOUDFRONT_FUNCTION_NAME", cfFunction.functionName);
+        fn.addEnvironment(
+          "CLOUDFRONT_DOMAIN",
+          distribution.distributionDomainName
+        );
+        fn.addEnvironment("VIEWER_CERT_SSM_PARAM", viewerCertSsmParamName);
+        fn.node.addDependency(seedViewerCertArn);
       }
 
       new cdk.CfnOutput(this, "ServiceUrl", {
