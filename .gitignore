@@ -3,6 +3,7 @@
 !lib/authorizer/index.js
 !lib/frontend-authorizer/index.js
 !lib/auth-lambda/index.js
+!lib/cognito-triggers/**/index.js
 *.d.ts
 node_modules
 

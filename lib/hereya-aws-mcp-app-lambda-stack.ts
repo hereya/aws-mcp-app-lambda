@@ -12,6 +12,7 @@ import * as authorizers from "aws-cdk-lib/aws-apigatewayv2-authorizers";
 import * as cloudfront from "aws-cdk-lib/aws-cloudfront";
 import * as origins from "aws-cdk-lib/aws-cloudfront-origins";
 import * as cr from "aws-cdk-lib/custom-resources";
+import * as dynamodb from "aws-cdk-lib/aws-dynamodb";
 import { Construct } from "constructs";
 import * as path from "path";
 
@@ -172,6 +173,74 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     });
 
     // -----------------------------------------------------------------------
+    // Per-app auth: shared multi-tenant Cognito triggers + OTP table.
+    //
+    // `enable-auth` provisions a dedicated Cognito user pool per app. All
+    // pools across the org are wired to the same 4 challenge trigger Lambdas
+    // declared here — the triggers are pool-agnostic (they read
+    // event.userPoolId at runtime). The OTP table is keyed by
+    // (pool_id, email) so concurrent logins across pools can't collide.
+    // -----------------------------------------------------------------------
+
+    const otpTable = new dynamodb.Table(this, "AppAuthOtpTable", {
+      partitionKey: {
+        name: "pool_id",
+        type: dynamodb.AttributeType.STRING,
+      },
+      sortKey: { name: "email", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      timeToLiveAttribute: "ttl",
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
+    const triggerEnv = { OTP_TABLE_NAME: otpTable.tableName };
+    const makeTrigger = (id: string, dir: string) =>
+      new lambda.Function(this, id, {
+        runtime: lambda.Runtime.NODEJS_22_X,
+        handler: "index.handler",
+        code: lambda.Code.fromAsset(
+          path.join(__dirname, "cognito-triggers", dir)
+        ),
+        memorySize: 128,
+        timeout: cdk.Duration.seconds(10),
+        environment: triggerEnv,
+      });
+
+    const preSignUpFn = makeTrigger("PreSignUpTrigger", "pre-sign-up");
+    const defineChallengeFn = makeTrigger(
+      "DefineAuthChallengeTrigger",
+      "define-auth-challenge"
+    );
+    const createChallengeFn = makeTrigger(
+      "CreateAuthChallengeTrigger",
+      "create-auth-challenge"
+    );
+    const verifyChallengeFn = makeTrigger(
+      "VerifyAuthChallengeTrigger",
+      "verify-auth-challenge"
+    );
+
+    otpTable.grantReadWriteData(createChallengeFn);
+    otpTable.grantReadWriteData(verifyChallengeFn);
+
+    // Verify trigger also updates the Cognito user attribute `email_verified`.
+    // Scoping to resource="*" because per-app pools are created at runtime by
+    // the org Lambda — we can't pin a single ARN at stack deploy time.
+    verifyChallengeFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["cognito-idp:AdminUpdateUserAttributes"],
+        resources: ["*"],
+      })
+    );
+
+    const triggerArns = [
+      preSignUpFn.functionArn,
+      defineChallengeFn.functionArn,
+      createChallengeFn.functionArn,
+      verifyChallengeFn.functionArn,
+    ];
+
+    // -----------------------------------------------------------------------
     // MCP OAuth Authorizer Lambda
     // -----------------------------------------------------------------------
 
@@ -274,7 +343,8 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     let authIntegrationId: string | undefined;
 
     if (cognitoUserPoolId && cognitoClientId) {
-      // Frontend Authorizer Lambda
+      // Frontend Authorizer Lambda (multi-tenant: per-app pool lookup via DB,
+      // with shared-pool fallback for Phase-A migration).
       const frontendAuthorizerFn = new lambda.Function(
         this,
         "FrontendAuthorizerHandler",
@@ -289,9 +359,23 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
           environment: {
             COGNITO_USER_POOL_ID: cognitoUserPoolId,
             COGNITO_REGION: cognitoRegion,
+            clusterArn: plainEnv["clusterArn"] ?? "",
+            secretArn: plainEnv["secretArn"] ?? "",
+            databaseName: plainEnv["databaseName"] ?? "",
           },
         }
       );
+
+      // Apply Aurora Data API policies from dep packages so the authorizer can
+      // SELECT from public._app_auth.
+      for (const [, value] of Object.entries(policyEnv)) {
+        const policy = JSON.parse(value as string);
+        for (const statement of policy.Statement) {
+          frontendAuthorizerFn.addToRolePolicy(
+            iam.PolicyStatement.fromJson(statement)
+          );
+        }
+      }
 
       // Grant API Gateway permission to invoke the frontend authorizer
       frontendAuthorizerFn.addPermission("ApiGwAuthorizerInvoke", {
@@ -316,7 +400,9 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       );
       frontendAuthorizerId = frontendAuthorizerCfn.ref;
 
-      // Auth Lambda (login/OTP/verify/logout)
+      // Auth Lambda (login/OTP/verify/logout). Multi-tenant: extracts app from
+      // path, looks up per-app pool client + Postmark token, falls back to the
+      // shared org pool for unmigrated apps.
       const authLambdaEnv: Record<string, string> = {
         COGNITO_USER_POOL_ID: cognitoUserPoolId,
         COGNITO_CLIENT_ID: cognitoClientId,
@@ -324,6 +410,10 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         CUSTOM_DOMAIN: customDomain ?? "",
         BUCKET_NAME: plainEnv["bucketName"] ?? "",
         S3_PREFIX: plainEnv["s3Prefix"] ?? "",
+        ORGANIZATION_ID: organizationId,
+        clusterArn: plainEnv["clusterArn"] ?? "",
+        secretArn: plainEnv["secretArn"] ?? "",
+        databaseName: plainEnv["databaseName"] ?? "",
       };
 
       const authLambdaFn = new lambda.Function(this, "AuthLambdaHandler", {
@@ -346,13 +436,45 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
         authLambdaFn.addEnvironment("SECRET_KEYS", authSecretKeys.join(","));
       }
 
-      // Grant Auth Lambda Cognito permissions
+      // Grant Auth Lambda Cognito permissions + Data API (to read _app_auth).
       for (const [, value] of Object.entries(policyEnv)) {
         const policy = JSON.parse(value as string);
         for (const statement of policy.Statement) {
           authLambdaFn.addToRolePolicy(iam.PolicyStatement.fromJson(statement));
         }
       }
+
+      // Read per-app Postmark server token from SSM SecureString.
+      const appAuthSsmArn = `arn:aws:ssm:${this.region}:${this.account}:parameter/hereya/${organizationId}/apps/*`;
+      authLambdaFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["ssm:GetParameter"],
+          resources: [appAuthSsmArn],
+        })
+      );
+      authLambdaFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: ["kms:Decrypt"],
+          resources: ["*"],
+          conditions: {
+            StringEquals: {
+              "kms:ViaService": `ssm.${this.region}.amazonaws.com`,
+            },
+          },
+        })
+      );
+
+      // Allow InitiateAuth / RespondToAuthChallenge against any per-app pool
+      // in this account (pool ARNs are created at runtime by enable-auth).
+      authLambdaFn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "cognito-idp:InitiateAuth",
+            "cognito-idp:RespondToAuthChallenge",
+          ],
+          resources: ["*"],
+        })
+      );
 
       // Grant API Gateway permission to invoke auth Lambda
       authLambdaFn.addPermission("ApiGwInvoke", {
@@ -489,6 +611,8 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     fn.addEnvironment("AWS_ACCOUNT_ID", this.account);
     fn.addEnvironment("ORGANIZATION_ID", organizationId);
     fn.addEnvironment("AGENT_SECRET_SSM_PREFIX", `/hereya/${organizationId}/apps`);
+    fn.addEnvironment("COGNITO_TRIGGER_LAMBDA_ARNS", triggerArns.join(","));
+    fn.addEnvironment("awsRegion", this.region);
 
     if (frontendAuthorizerId) {
       fn.addEnvironment("FRONTEND_AUTHORIZER_ID", frontendAuthorizerId);
@@ -496,6 +620,42 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     if (authIntegrationId) {
       fn.addEnvironment("AUTH_INTEGRATION_ID", authIntegrationId);
     }
+
+    // -----------------------------------------------------------------------
+    // Org Lambda: per-app auth provisioning permissions (enable-auth tool).
+    //
+    // Per-app Cognito pools + clients are created at runtime (resources are
+    // only known after CreateUserPool succeeds), so resource="*". The org
+    // Lambda needs to attach the shared trigger Lambdas to each new pool
+    // (AddPermission) and clean them up on drop-schema (RemovePermission).
+    // -----------------------------------------------------------------------
+
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          "cognito-idp:CreateUserPool",
+          "cognito-idp:DeleteUserPool",
+          "cognito-idp:UpdateUserPool",
+          "cognito-idp:DescribeUserPool",
+          "cognito-idp:ListUserPools",
+          "cognito-idp:CreateUserPoolClient",
+          "cognito-idp:DeleteUserPoolClient",
+          "cognito-idp:UpdateUserPoolClient",
+          "cognito-idp:DescribeUserPoolClient",
+          "cognito-idp:AdminCreateUser",
+          "cognito-idp:ListUsers",
+          "cognito-idp:TagResource",
+        ],
+        resources: ["*"],
+      })
+    );
+
+    fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ["lambda:AddPermission", "lambda:RemovePermission"],
+        resources: triggerArns,
+      })
+    );
 
     // -----------------------------------------------------------------------
     // Custom domain + DNS
@@ -517,6 +677,23 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       const hostedZone = route53.HostedZone.fromLookup(this, "HostedZone", {
         domainName: customDomainZone,
       });
+
+      // Expose hosted zone ID + grant Route53 record-set management so the
+      // org Lambda can write DKIM + return-path records when provisioning
+      // per-app Postmark domains via enable-auth.
+      fn.addEnvironment("HOSTED_ZONE_ID", hostedZone.hostedZoneId);
+      fn.addToRolePolicy(
+        new iam.PolicyStatement({
+          actions: [
+            "route53:ChangeResourceRecordSets",
+            "route53:ListResourceRecordSets",
+            "route53:GetHostedZone",
+          ],
+          resources: [
+            `arn:aws:route53:::hostedzone/${hostedZone.hostedZoneId}`,
+          ],
+        })
+      );
 
       // API Gateway custom domain for MCP (exact domain)
       const domainName = new apigwv2.DomainName(this, "DomainName", {
