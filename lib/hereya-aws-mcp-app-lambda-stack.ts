@@ -600,6 +600,23 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       })
     );
 
+    // Per-app Lambdas may opt in to registering users server-side via the
+    // hereya runtime's users.addUser helper. Since per-app Cognito pools are
+    // locked to AllowAdminCreateUserOnly=true, the helper calls
+    // AdminCreateUser. Scope by the HereyaOrg tag on the pool so one org's
+    // per-app Lambdas cannot create users in another org's pools.
+    appLambdaRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ["cognito-idp:AdminCreateUser"],
+        resources: ["*"],
+        conditions: {
+          StringEquals: {
+            "aws:ResourceTag/HereyaOrg": organizationId,
+          },
+        },
+      })
+    );
+
     // -----------------------------------------------------------------------
     // Org Lambda: environment variables for per-app Lambda management
     // -----------------------------------------------------------------------
