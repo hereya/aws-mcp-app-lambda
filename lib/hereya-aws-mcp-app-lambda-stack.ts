@@ -812,7 +812,18 @@ function handler(event) {
                   headerBehavior:
                     cloudfront.OriginRequestHeaderBehavior.allowList(
                       "Content-Type",
-                      "Accept-Language"
+                      "Accept-Language",
+                      // The subdomain-rewrite viewer-request CF function copies
+                      // the viewer Host into x-forwarded-host so the auth Lambda
+                      // can scope the session cookie's Domain attribute to the
+                      // host the user actually typed (including custom vanity
+                      // domains). CloudFront strips headers added by viewer-
+                      // request functions before forwarding to origin unless
+                      // they're explicitly whitelisted here — without this
+                      // entry, vanity-host logins set a cookie scoped to the
+                      // default customDomain and the browser silently rejects
+                      // it (RFC 6265 domain mismatch), breaking login.
+                      "x-forwarded-host"
                     ),
                   queryStringBehavior:
                     cloudfront.OriginRequestQueryStringBehavior.all(),
