@@ -651,6 +651,20 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     }
 
     // -----------------------------------------------------------------------
+    // Per-app lightweight state table (DynamoDB, on-demand). Used for cheap
+    // "is there something new?" flags so polling loops don't have to query
+    // Aurora (which would keep it from scaling to zero). Org-scoped (one table
+    // per deployment); items are keyed per app via the partition key.
+    // -----------------------------------------------------------------------
+    const appStateTable = new dynamodb.Table(this, "AppStateTable", {
+      partitionKey: { name: "pk", type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+    fn.addEnvironment("APP_STATE_TABLE", appStateTable.tableName);
+    appStateTable.grantReadWriteData(fn);
+
+    // -----------------------------------------------------------------------
     // Org Lambda: per-app auth provisioning permissions (enable-auth tool).
     //
     // Per-app Cognito pools + clients are created at runtime (resources are
