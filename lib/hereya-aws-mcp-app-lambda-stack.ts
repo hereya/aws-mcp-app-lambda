@@ -835,7 +835,14 @@ function handler(event) {
                       // entry, vanity-host logins set a cookie scoped to the
                       // default customDomain and the browser silently rejects
                       // it (RFC 6265 domain mismatch), breaking login.
-                      "x-forwarded-host"
+                      "x-forwarded-host",
+                      // Inbound webhook providers carry a shared secret in a
+                      // custom header that the per-app webhook handler verifies.
+                      // CloudFront whitelists headers forwarded to origin, so
+                      // these must be listed or they're stripped (causing the
+                      // handler to 401 every delivery). Telegram uses
+                      // X-Telegram-Bot-Api-Secret-Token.
+                      "X-Telegram-Bot-Api-Secret-Token"
                     ),
                   queryStringBehavior:
                     cloudfront.OriginRequestQueryStringBehavior.all(),
