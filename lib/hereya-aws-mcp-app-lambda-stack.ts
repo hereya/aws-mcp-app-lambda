@@ -332,6 +332,18 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
       authorizer: httpAuthorizer,
     });
 
+    // Allow API Gateway to invoke the org Lambda on ANY route of this API.
+    // HttpLambdaIntegration only grants a route-specific permission for /mcp,
+    // but the org Lambda creates additional routes at runtime that target
+    // itself (e.g. per-app Telegram webhooks at /{schema}/telegram/{proxy+}).
+    // Without an api-scoped permission those routes return 500 (API Gateway
+    // cannot invoke the Lambda), and the org Lambda cannot self-grant
+    // (its lambda:AddPermission IAM is scoped to per-app function names only).
+    fn.addPermission("HttpApiInvokeAll", {
+      principal: new iam.ServicePrincipal("apigateway.amazonaws.com"),
+      sourceArn: `arn:aws:execute-api:${this.region}:${this.account}:${httpApi.apiId}/*/*`,
+    });
+
     // -----------------------------------------------------------------------
     // Frontend Authorizer + Auth Lambda (for per-app Lambdas)
     // -----------------------------------------------------------------------
