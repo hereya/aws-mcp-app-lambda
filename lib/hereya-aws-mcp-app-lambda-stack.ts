@@ -46,6 +46,22 @@ export class HereyaAwsMcpAppLambdaStack extends cdk.Stack {
     const customDomainZone =
       process.env["customDomainZone"] ?? extractDomainZone(customDomain);
     const wildcardCertificateArn = process.env["wildcardCertificateArn"];
+    // Extra request headers the frontend CloudFront distribution should forward to
+    // origin (comma-separated). CloudFront strips any header not whitelisted, so
+    // custom auth/webhook headers must be listed here. NOTE: `Authorization` CANNOT
+    // be added to an OriginRequestPolicy (AWS only allows it via a cache policy) —
+    // use a custom header name instead (e.g. X-Dilaya-Agent-Token for the agent poll).
+    const additionalForwardedHeaders = (process.env["additionalForwardedHeaders"] ?? "")
+      .split(",")
+      .map((h) => h.trim())
+      .filter(Boolean);
+    const frontendForwardHeaders = [
+      "Content-Type",
+      "Accept-Language",
+      "x-forwarded-host",
+      "X-Telegram-Bot-Api-Secret-Token",
+      ...additionalForwardedHeaders,
+    ].filter((h, i, a) => a.findIndex((x) => x.toLowerCase() === h.toLowerCase()) === i);
 
     // Parse hereyaProjectEnv
     const env: Record<string, string> = JSON.parse(
@@ -835,28 +851,15 @@ function handler(event) {
                       "hereya_id_token",
                       "hereya_agent"
                     ),
+                  // Base set + `additionalForwardedHeaders` (built at the top of
+                  // the constructor). CloudFront strips any header not whitelisted
+                  // here, so custom auth/webhook headers (x-forwarded-host for
+                  // vanity-host login cookies; X-Telegram-Bot-Api-Secret-Token for
+                  // the Telegram webhook; X-Dilaya-Agent-Token for the agent poll)
+                  // must appear in this list or the origin never sees them.
                   headerBehavior:
                     cloudfront.OriginRequestHeaderBehavior.allowList(
-                      "Content-Type",
-                      "Accept-Language",
-                      // The subdomain-rewrite viewer-request CF function copies
-                      // the viewer Host into x-forwarded-host so the auth Lambda
-                      // can scope the session cookie's Domain attribute to the
-                      // host the user actually typed (including custom vanity
-                      // domains). CloudFront strips headers added by viewer-
-                      // request functions before forwarding to origin unless
-                      // they're explicitly whitelisted here — without this
-                      // entry, vanity-host logins set a cookie scoped to the
-                      // default customDomain and the browser silently rejects
-                      // it (RFC 6265 domain mismatch), breaking login.
-                      "x-forwarded-host",
-                      // Inbound webhook providers carry a shared secret in a
-                      // custom header that the per-app webhook handler verifies.
-                      // CloudFront whitelists headers forwarded to origin, so
-                      // these must be listed or they're stripped (causing the
-                      // handler to 401 every delivery). Telegram uses
-                      // X-Telegram-Bot-Api-Secret-Token.
-                      "X-Telegram-Bot-Api-Secret-Token"
+                      ...frontendForwardHeaders
                     ),
                   queryStringBehavior:
                     cloudfront.OriginRequestQueryStringBehavior.all(),
